@@ -192,6 +192,50 @@ it's non-loopback). If you call `create_app(bound_host=…)`
 directly instead of using `hermes-agui`, pass the real serve interface — the
 token/Host checks are enforced against that value.
 
+### Model-invisible run context for trusted embedders
+
+An authenticated server-side BFF may need to make opaque per-request
+authorization or tenancy data available to a curated server tool without
+putting that data in the model prompt or AG-UI payload. Embedded deployments
+can opt into the `create_app(private_context_resolver=...)` seam:
+
+```python
+from agui_adapter.private_context import get_run_private_context
+from agui_adapter.server import create_app
+
+async def resolve_private_context(request):
+    # Authenticate/verify here. Never accept identity or authority from the
+    # AG-UI body. Raise to reject the run with a controlled 401 response.
+    return {"authorization": request.headers["x-internal-run-token"]}
+
+app = create_app(private_context_resolver=resolve_private_context)
+
+# Inside a server/plugin tool handler running for that request:
+authorization = get_run_private_context()
+```
+
+The resolver is disabled by default. When configured it runs before the JSON
+body is read or validated, so rejected callers cannot make the adapter parse
+an unauthenticated body first. Its return value is bound to the worker for that
+run, propagates to Hermes parallel tool workers through the existing audited
+context wrapper, and resets on success or failure. It is not copied
+into `RunAgentInput`, `context`, `state`, `forwarded_props`, model/provider
+messages or headers, health output, or SSE events. Approval park/resume keeps
+the original worker and therefore the original private context; a resume
+request cannot replace it.
+
+The resolver seam does **not** authorize ownership of an AG-UI thread or parked
+approval. Resume routing uses `thread_id` plus the opaque `interrupt_id`; the
+new request's resolved context is intentionally discarded rather than compared
+to the original run. A multi-user embedder must authorize that the caller owns
+the requested thread/resume at its BFF boundary before proxying to this adapter.
+Treat `interrupt_id` as a correlation secret, not as tenant authorization.
+
+Treat the resolver and every tool allowed to read this context as trusted code:
+a malicious or careless tool can still print, return, or log data it reads.
+Use a narrow opaque capability, expose only curated toolsets, avoid putting
+secrets in exception messages, and keep application logs free of payloads.
+
 ## How it works
 
 ```

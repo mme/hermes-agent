@@ -39,12 +39,13 @@ produced, post-run, in message order.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import threading
 from collections import deque
 from concurrent.futures import InvalidStateError
-from typing import Any, Deque, Dict, List, Optional, Set
+from typing import Any, Callable, Deque, Dict, List, Optional, Set
 
 from ag_ui.core import (
     RunAgentInput,
@@ -62,6 +63,13 @@ from fastapi.responses import StreamingResponse
 
 from agui_adapter import resume_shim, translate
 from agui_adapter.events import AGUIEventBridge
+from agui_adapter.private_context import (
+    _coerce_run_private_context,
+    _new_run_private_context,
+    _reset_run_private_context,
+    _set_run_private_context,
+    _RunPrivateContext,
+)
 from agui_adapter.session import (
     AgentConfig,
     RunState,
@@ -141,7 +149,8 @@ def _server_tool_results_by_name(
 
 
 def _run_turn(run_input: RunAgentInput, config: AgentConfig, bridge: AGUIEventBridge,
-              fwd_headers: Dict[str, str], approval_cb=None, on_agent=None) -> Dict[str, Any]:
+              fwd_headers: Dict[str, str], approval_cb=None, on_agent=None,
+              private_context: Any = None) -> Dict[str, Any]:
     """Build + configure the agent and run one turn (on a worker thread).
 
     ``on_agent`` (if given) is called with the constructed agent before the turn
@@ -223,9 +232,20 @@ def _run_turn(run_input: RunAgentInput, config: AgentConfig, bridge: AGUIEventBr
         # has no background push channel (like the API server).
         session_tokens = set_session_vars(session_key=run_input.thread_id,
                                           async_delivery=False)
+    # Bind only for the synchronous run itself. This is late enough that agent
+    # construction/model setup cannot observe the value, but covers lifecycle
+    # hooks and every server-tool dispatch. Parallel tool workers inherit it
+    # through Hermes's audited propagate_context_to_thread() wrapper.
+    private_scope = _coerce_run_private_context(private_context)
+    private_context_token = _set_run_private_context(private_scope)
     try:
         result = agent.run_conversation(prep.user_message, conversation_history=prep.conversation_history)
     finally:
+        # Clear the shared holder before resetting this worker's ContextVar.
+        # Any copied context in a late/outliving tool thread immediately loses
+        # access too, even before that thread unwinds.
+        private_scope.clear()
+        _reset_run_private_context(private_context_token)
         if interactive_token is not None:
             reset_hermes_interactive_context(interactive_token)
         if approval_cb is not None:
@@ -309,6 +329,12 @@ def _approval_timeout() -> float:
 _run_agents: Dict[str, Any] = {}
 _run_agents_lock = threading.Lock()
 
+# Revocable private scopes belonging to those same running workers, keyed by
+# their run queue identity. A parked approval hands the SAME queue to its resume
+# stream, so disconnect can revoke the original scope without aliasing a newer
+# malformed same-thread run.
+_run_private_contexts: Dict[Any, _RunPrivateContext] = {}
+
 
 def _register_run_agent(thread_id: str, agent: Any) -> None:
     with _run_agents_lock:
@@ -321,6 +347,24 @@ def _unregister_run_agent(thread_id: str, agent: Any) -> None:
     with _run_agents_lock:
         if _run_agents.get(thread_id) is agent:
             _run_agents.pop(thread_id, None)
+
+
+def _register_run_private_context(run_queue: Any, scope: _RunPrivateContext) -> None:
+    with _run_agents_lock:
+        _run_private_contexts[run_queue] = scope
+
+
+def _unregister_run_private_context(run_queue: Any, scope: _RunPrivateContext) -> None:
+    with _run_agents_lock:
+        if _run_private_contexts.get(run_queue) is scope:
+            _run_private_contexts.pop(run_queue, None)
+
+
+def _revoke_run_private_context(run_queue: Any) -> None:
+    with _run_agents_lock:
+        scope = _run_private_contexts.get(run_queue)
+    if scope is not None:
+        scope.clear()
 
 
 def _interrupt_run(thread_id: str, run_id: str) -> None:
@@ -345,62 +389,91 @@ def _interrupt_run(thread_id: str, run_id: str) -> None:
 
 
 async def _event_stream(run_input: RunAgentInput, encoder: EventEncoder,
-                        config: AgentConfig, fwd_headers: Dict[str, str]):
+                        config: AgentConfig, fwd_headers: Dict[str, str],
+                        private_context: Any = None):
     from agui_adapter import approvals
 
     loop = asyncio.get_running_loop()
+    request_private_scope = (
+        _coerce_run_private_context(private_context)
+        if private_context is not None
+        else None
+    )
 
     # ---- Resume run: re-attach to a parked worker and resolve its decision ----
     if getattr(run_input, "resume", None):
+        # Authentication may resolve a fresh value for this HTTP request, but a
+        # resume continues the ORIGINAL worker and must keep its original
+        # authority. Drop the unused request scope immediately.
+        if request_private_scope is not None:
+            request_private_scope.clear()
         parked = approvals.take(run_input.thread_id)
-        yield encoder.encode(RunStartedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id))
-        if parked is None:
-            logger.info("AG-UI resume with no parked approval (thread=%s run=%s)",
-                        run_input.thread_id, run_input.run_id)
-            yield encoder.encode(RunErrorEvent(
-                message="No pending approval for this thread (expired, unknown, or server restarted)."))
-            return
-        logger.info("AG-UI resume re-attaching parked worker (thread=%s run=%s)",
-                    run_input.thread_id, run_input.run_id)
-        queue = parked.queue
-        # Resolve the decision to unblock the parked worker, then drain the SAME
-        # queue the worker resumes writing to as it continues inline.
         try:
-            decision = approvals.resume_to_decision(run_input.resume, parked.pending.interrupt_id)
-        except Exception:
-            logger.exception("AG-UI resume decode failed")
-            # Unblock the parked worker (deny) so it can't leak, then report.
+            # Keep the initial lifecycle frame inside the same cancellation
+            # guard as decision resolution and queue draining. If the client
+            # disconnects immediately after RUN_STARTED, the parked worker has
+            # already been removed from the registry and must be denied/revoked
+            # here rather than left blocked until timeout.
+            yield encoder.encode(
+                RunStartedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id)
+            )
+            if parked is None:
+                logger.info("AG-UI resume with no parked approval (thread=%s run=%s)",
+                            run_input.thread_id, run_input.run_id)
+                yield encoder.encode(RunErrorEvent(
+                    message="No pending approval for this thread (expired, unknown, or server restarted)."))
+                return
+            logger.info("AG-UI resume re-attaching parked worker (thread=%s run=%s)",
+                        run_input.thread_id, run_input.run_id)
+            queue = parked.queue
+            # Resolve the decision to unblock the parked worker, then drain the
+            # SAME queue the worker resumes writing to as it continues inline.
             try:
-                if not parked.pending.decision.done():
-                    parked.pending.decision.set_result("deny")
+                decision = approvals.resume_to_decision(
+                    run_input.resume, parked.pending.interrupt_id
+                )
             except Exception:
-                pass
-            yield encoder.encode(RunErrorEvent(message="Invalid resume payload."))
-            return
-        if not parked.pending.allow_permanent and decision == "always":
-            decision = "session"
-        try:
-            parked.pending.decision.set_result(decision)
-        except InvalidStateError:
-            # The worker already claimed the future on timeout (deny). Report cleanly.
-            logger.info("AG-UI resume arrived after approval timeout (thread=%s run=%s)",
-                        run_input.thread_id, run_input.run_id)
-            yield encoder.encode(RunErrorEvent(message="Approval already timed out."))
-            return
-        # The resumed turn runs inline on the ORIGINAL (parked) worker, whose
-        # agent is still registered under this thread_id — so a disconnect here
-        # (often the longest leg: the approved command actually executes) can
-        # interrupt it, same as a fresh run.
-        try:
+                logger.exception("AG-UI resume decode failed")
+                # Unblock the parked worker (deny) so it can't leak, then report.
+                try:
+                    if not parked.pending.decision.done():
+                        parked.pending.decision.set_result("deny")
+                except Exception:
+                    pass
+                yield encoder.encode(RunErrorEvent(message="Invalid resume payload."))
+                return
+            if not parked.pending.allow_permanent and decision == "always":
+                decision = "session"
+            try:
+                parked.pending.decision.set_result(decision)
+            except InvalidStateError:
+                # The worker already claimed the future on timeout (deny).
+                logger.info("AG-UI resume arrived after approval timeout (thread=%s run=%s)",
+                            run_input.thread_id, run_input.run_id)
+                yield encoder.encode(RunErrorEvent(message="Approval already timed out."))
+                return
+            # The resumed turn runs inline on the ORIGINAL (parked) worker,
+            # whose agent remains registered under this thread_id.
             async for frame in _consume_queue(queue, encoder, run_input):
                 yield frame
         except (asyncio.CancelledError, GeneratorExit):
-            _interrupt_run(run_input.thread_id, run_input.run_id)
+            if parked is not None:
+                # Revoke before waking the worker so code immediately after the
+                # approval callback cannot observe the old authority.
+                _revoke_run_private_context(parked.queue)
+                try:
+                    if not parked.pending.decision.done():
+                        parked.pending.decision.set_result("deny")
+                except Exception:
+                    pass
+                _interrupt_run(run_input.thread_id, run_input.run_id)
             raise
         return
 
     # ---- Fresh run ----
     if approvals.is_parked(run_input.thread_id):
+        if request_private_scope is not None:
+            request_private_scope.clear()
         logger.info("AG-UI fresh run rejected; approval already parked (thread=%s run=%s)",
                     run_input.thread_id, run_input.run_id)
         yield encoder.encode(RunStartedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id))
@@ -420,6 +493,7 @@ async def _event_stream(run_input: RunAgentInput, encoder: EventEncoder,
 
     bridge = AGUIEventBridge(emit)
     known_ids = _input_tool_call_ids(run_input.messages)
+    private_scope = request_private_scope or _new_run_private_context(None)
 
     approval_cb = approvals.make_approval_callback(
         thread_id=run_input.thread_id,
@@ -437,8 +511,15 @@ async def _event_stream(run_input: RunAgentInput, encoder: EventEncoder,
 
     def worker() -> None:
         try:
-            out = _run_turn(run_input, config, bridge, fwd_headers, approval_cb=approval_cb,
-                            on_agent=_on_agent)
+            out = _run_turn(
+                run_input,
+                config,
+                bridge,
+                fwd_headers,
+                approval_cb=approval_cb,
+                on_agent=_on_agent,
+                private_context=private_scope,
+            )
             result = out["result"]
             frontend_names = out["frontend_names"]
             state_writer_names = out["state_writer_names"]
@@ -539,13 +620,29 @@ async def _event_stream(run_input: RunAgentInput, encoder: EventEncoder,
             # scoped discard). A thread-scoped discard in this finally could
             # delete a newer, unrelated entry parked for the same thread_id.
             # Same guarded emit() path as every other worker->loop enqueue.
+            # _run_turn clears this on every path after it binds the scope. This
+            # outer clear covers failures that happen earlier (for example while
+            # constructing the agent) and is intentionally idempotent.
+            private_scope.clear()
             emit(approvals.DONE)
             _unregister_run_agent(run_input.thread_id, worker_agent["agent"])
+            _unregister_run_private_context(queue, private_scope)
 
-    threading.Thread(target=worker, name="hermes-agui-run", daemon=True).start()
-
-    yield encoder.encode(RunStartedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id))
     try:
+        _register_run_private_context(queue, private_scope)
+        threading.Thread(target=worker, name="hermes-agui-run", daemon=True).start()
+    except BaseException:
+        private_scope.clear()
+        _unregister_run_private_context(queue, private_scope)
+        raise
+
+    try:
+        # Include the first lifecycle frame in the cancellation guard. An
+        # immediate disconnect at this yield must revoke authorization just as
+        # a disconnect during later queue draining does.
+        yield encoder.encode(
+            RunStartedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id)
+        )
         async for frame in _consume_queue(queue, encoder, run_input):
             yield frame
     except (asyncio.CancelledError, GeneratorExit):
@@ -554,13 +651,19 @@ async def _event_stream(run_input: RunAgentInput, encoder: EventEncoder,
         # interrupt check instead of running the whole turn for a gone client.
         # Best-effort + cooperative: the daemon worker still drains to DONE onto
         # a queue nobody reads (emit() is guarded against the closed loop).
+        # Revoke THIS fresh run by object identity. A malformed client can race
+        # two runs on one thread_id; consulting the registry here could revoke a
+        # newer run that replaced this slot. Copied ContextVars in parallel tool
+        # workers hold this same revocable scope.
+        private_scope.clear()
         _interrupt_run(run_input.thread_id, run_input.run_id)
         raise
 
 
 def create_app(config: Optional[AgentConfig] = None, *,
                session_token: Optional[str] = None,
-               bound_host: str = "127.0.0.1") -> FastAPI:
+               bound_host: str = "127.0.0.1",
+               private_context_resolver: Optional[Callable[[Request], Any]] = None) -> FastAPI:
     """Build the AG-UI FastAPI app.
 
     ``bound_host`` MUST match the interface the app is actually served on
@@ -574,6 +677,15 @@ def create_app(config: Optional[AgentConfig] = None, *,
     downstream can detect or correct it. ``entry.main()`` is what couples the
     two values today (it derives ``bound_host`` from the same host it passes
     to uvicorn) -- any new entry point MUST preserve that coupling.
+
+    ``private_context_resolver`` is an opt-in embedding seam for trusted
+    server-side authorization/tenancy data. It receives the authenticated
+    FastAPI request and may return a value (or awaitable) that server/plugin
+    tool handlers read through
+    :func:`agui_adapter.private_context.get_run_private_context`. The value is
+    bound only on the run's worker context and is never added to model input,
+    provider headers, AG-UI state, or outbound events. Resolver failure rejects
+    the request before streaming with a controlled 401 response.
     """
     config = config or AgentConfig()
 
@@ -622,18 +734,62 @@ def create_app(config: Optional[AgentConfig] = None, *,
 
     @app.post("/")
     async def run_agent_endpoint(request: Request) -> Response:
+        # Resolve trusted authority before reading/parsing attacker-controlled
+        # request content. A configured resolver is an authentication boundary,
+        # so a rejected caller must not be able to make the JSON parser consume
+        # an arbitrary body first.
+        private_context = None
+        if private_context_resolver is not None:
+            try:
+                resolved_context = private_context_resolver(request)
+                if inspect.isawaitable(resolved_context):
+                    resolved_context = await resolved_context
+                if resolved_context is None:
+                    raise ValueError("private context resolver returned no context")
+                private_context = _new_run_private_context(resolved_context)
+            except Exception:  # noqa: BLE001 - private details never leave this boundary
+                # Do not log the exception: resolver errors can contain raw
+                # authorization material. The embedder gets a controlled,
+                # fail-closed response with no attacker-controlled detail.
+                logger.warning("AG-UI private context resolver rejected a run request")
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Private run context unavailable."},
+                )
+
         # Returns a StreamingResponse (SSE) on the happy path, or a JSONResponse
         # on a malformed body — hence the Response supertype annotation.
         try:
             body = await request.json()
             run_input = RunAgentInput.model_validate(body)
         except Exception:  # noqa: BLE001 - malformed JSON or schema violation
+            if private_context is not None:
+                private_context.clear()
             return JSONResponse(status_code=400, content={"detail": "Invalid request body."})
-        encoder = EventEncoder(accept=request.headers.get("accept"))
-        fwd_headers = _collect_forward_headers(request.headers)
-        return StreamingResponse(
-            _event_stream(run_input, encoder, config, fwd_headers),
-            media_type=encoder.get_content_type(),
-        )
+        except BaseException:
+            # Cancellation/shutdown must not retain an already-resolved secret.
+            if private_context is not None:
+                private_context.clear()
+            raise
+
+        try:
+            encoder = EventEncoder(accept=request.headers.get("accept") or "")
+            fwd_headers = _collect_forward_headers(request.headers)
+            return StreamingResponse(
+                _event_stream(
+                    run_input,
+                    encoder,
+                    config,
+                    fwd_headers,
+                    private_context=private_context,
+                ),
+                media_type=encoder.get_content_type(),
+            )
+        except BaseException:
+            # Ownership transfers to _event_stream only after the response is
+            # constructed. Revoke on any earlier construction failure.
+            if private_context is not None:
+                private_context.clear()
+            raise
 
     return app
